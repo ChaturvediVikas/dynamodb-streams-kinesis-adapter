@@ -18,7 +18,10 @@ import com.amazonaws.services.dynamodbv2.streamsadapter.util.KinesisMapperUtil;
 import com.google.common.annotations.VisibleForTesting;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.services.dynamodb.model.ShardFilterType;
 import software.amazon.awssdk.services.kinesis.model.ChildShard;
+import software.amazon.awssdk.services.kinesis.model.Shard;
+import software.amazon.awssdk.services.kinesis.model.ShardFilter;
 import software.amazon.awssdk.utils.CollectionUtils;
 import software.amazon.kinesis.checkpoint.ShardRecordProcessorCheckpointer;
 import software.amazon.kinesis.common.InitialPositionInStreamExtended;
@@ -231,8 +234,50 @@ public class DynamoDBStreamsShutdownTask implements ConsumerTask {
         if (!CollectionUtils.isNullOrEmpty(childShards)) {
             createLeasesForChildShardsIfNotExist(scope);
             updateLeaseWithChildShards(currentShardLease);
+            log.info("Child leases created when shard {} reached its end", leaseKey);
         }
         attemptShardEndCheckpointing(leaseKey, scope, startTime);
+
+        // At this point, child lease has already been created for uninterrupted data processing.
+        // Now backfill child-shard-ids to fulfil cleanup conditions.
+        log.info("Attempt lineage backfill with child-shard-ids for shard {}", leaseKey);
+        fetchChildShardsForCompleteLineage(currentShardLease);
+    }
+
+    private void fetchChildShardsForCompleteLineage(Lease currentShardLease) {
+        Set<String> parentShardIds = currentShardLease.parentShardIds();
+        if (parentShardIds == null || parentShardIds.isEmpty()) {
+            return;
+        }
+        for (String parentShardId : parentShardIds) {
+            try {
+                Lease parentLease = leaseCoordinator.leaseRefresher().getLease(parentShardId);
+                if (parentLease == null) {
+                    continue;
+                }
+                if (!CollectionUtils.isNullOrEmpty(parentLease.childShardIds())) {
+                    continue; // already backfilled, lineage above is complete
+                }
+                ShardFilter shardFilter = ShardFilter.builder()
+                        .type(ShardFilterType.CHILD_SHARDS.toString())
+                        .shardId(parentShardId)
+                        .build();
+                List<Shard> fetchedChildShards = dynamoDBStreamsShardDetector.listShardsWithFilter(
+                        shardFilter, leaseCoordinator.leaseRefresher().getLeaseTableIdentifier());
+                if (fetchedChildShards != null && !fetchedChildShards.isEmpty()) {
+                    Set<String> childShardIds = fetchedChildShards.stream()
+                            .map(Shard::shardId)
+                            .collect(Collectors.toSet());
+                    Lease updatedLease = parentLease.copy();
+                    updatedLease.childShardIds(childShardIds);
+                    leaseCoordinator.leaseRefresher().updateLeaseWithMetaInfo(updatedLease, UpdateField.CHILD_SHARDS);
+                    log.info("Updated parent lease {} with child shard ids: {}", parentShardId, childShardIds);
+                }
+                fetchChildShardsForCompleteLineage(parentLease);
+            } catch (Exception e) {
+                log.error("Error in lineage completion for parent shard {}", parentShardId, e);
+            }
+        }
     }
 
     private boolean attemptShardEndCheckpointing(final String leaseKey, MetricsScope scope, long startTime)
